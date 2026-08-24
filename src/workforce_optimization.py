@@ -18,7 +18,8 @@ from pyomo.environ import (
 
 NUM_AGENTS = 12
 NUM_HOURS = 24
-SHORTAGE_PENALTY = 1000.0
+TOTAL_SHORTAGE_PENALTY = 100_000.0
+PEAK_SHORTAGE_PENALTY = 1_000.0
 
 SHIFT_DEFINITIONS = {
     0: {"name": "Night", "start": 0, "duration": 6, "cost": 78.0},
@@ -103,12 +104,18 @@ def build_model(demand: dict[int, int]) -> ConcreteModel:
 
     model.x = Var(model.I, model.K, domain=Binary)
     model.shortage = Var(model.T, domain=NonNegativeReals)
+    model.peak_shortage = Var(domain=NonNegativeReals)
 
     def shortage_rule(m, t):
         scheduled = sum(m.coverage[k, t] * m.x[i, k] for i in m.I for k in m.K)
         return m.shortage[t] >= m.demand[t] - scheduled
 
     model.shortage_constraint = Constraint(model.T, rule=shortage_rule)
+
+    def peak_shortage_rule(m, t):
+        return m.shortage[t] <= m.peak_shortage
+
+    model.peak_shortage_constraint = Constraint(model.T, rule=peak_shortage_rule)
 
     def one_shift_rule(m, i):
         return sum(m.x[i, k] for k in m.K) <= 1
@@ -120,12 +127,18 @@ def build_model(demand: dict[int, int]) -> ConcreteModel:
 
     model.eligibility_constraint = Constraint(model.I, model.K, rule=eligibility_rule)
 
-    shortage_term = SHORTAGE_PENALTY * sum(model.shortage[t] for t in model.T)
+    total_shortage_term = TOTAL_SHORTAGE_PENALTY * sum(
+        model.shortage[t] for t in model.T
+    )
+    peak_shortage_term = PEAK_SHORTAGE_PENALTY * model.peak_shortage
     labor_cost_term = sum(
         model.shift_cost[k] * model.x[i, k] for i in model.I for k in model.K
     )
 
-    model.objective = Objective(expr=shortage_term + labor_cost_term, sense=minimize)
+    model.objective = Objective(
+        expr=total_shortage_term + peak_shortage_term + labor_cost_term,
+        sense=minimize,
+    )
 
     return model
 
@@ -137,7 +150,9 @@ def solve_model(model: ConcreteModel) -> None:
 
     termination = str(results.solver.termination_condition)
     if termination.lower() not in {"optimal", "locallyoptimal", "globallyoptimal"}:
-        raise RuntimeError(f"Optimization did not finish with an optimal solution: {termination}")
+        raise RuntimeError(
+            f"Optimization did not finish with an optimal solution: {termination}"
+        )
 
     print(f"Solver termination: {termination}")
     print(f"Objective value: {value(model.objective):.2f}\n")
@@ -173,13 +188,17 @@ def solve_model(model: ConcreteModel) -> None:
         )
         shortage = value(model.shortage[t])
         total_shortage += shortage
-        print(f"{int(t):02d}:00 | {int(value(model.demand[t])):6d} | {int(round(scheduled)):9d} | {shortage:8.0f}")
+        print(
+            f"{int(t):02d}:00 | {int(value(model.demand[t])):6d} | "
+            f"{int(round(scheduled)):9d} | {shortage:8.0f}"
+        )
 
     for i in model.I:
         for k in model.K:
             total_cost += value(model.shift_cost[k]) * value(model.x[i, k])
 
     print(f"\nTotal shortage: {total_shortage:.0f} agent-hours")
+    print(f"Peak hourly shortage: {value(model.peak_shortage):.0f} agents")
     print(f"Total staffing cost: {total_cost:.2f}")
 
 
